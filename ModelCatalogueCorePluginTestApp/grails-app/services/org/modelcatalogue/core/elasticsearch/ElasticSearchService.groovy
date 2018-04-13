@@ -773,8 +773,10 @@ class ElasticSearchService implements SearchCatalogue {
 
         Callable<BulkRequestBuilder> c = { buildBulkIndexRequest(documents) }
 
+        // somehow get responses from requests
         Observable<BulkResponse> bulkResponses = RxElastic.from(c)
 
+        // create a stream that emits an error, if an item from a bulk response of bulkResponses failed.
         Observable<BulkResponse> bulkResponsesErrorChecked = bulkResponses.flatMap {
             BulkResponse bulkResponse ->
                 for (BulkItemResponse response in bulkResponse.items) {
@@ -797,10 +799,10 @@ class ElasticSearchService implements SearchCatalogue {
             IndexNotFoundException // sometimes by race condition
         ] as Set)
 
-        // on an error emitted by bulkResponsesErrorChecked,
+        // Create a stream that retries on errors emitted by bulkResponsesErrorChecked.
+        // On an error emitted by bulkResponsesErrorChecked,
         // retryWhen will re-subscribe to (re-start from the beginning of) bulkResponsesErrorChecked
-        // if whetherToRetryGivenThrowable accepts the error.
-
+        // if the function whetherToRetryGivenThrowable "accepts" the error.
         Observable<BulkResponse> bulkResponsesWithRetries = bulkResponsesErrorChecked.retryWhen(whetherToRetryGivenThrowable)
 
     }
