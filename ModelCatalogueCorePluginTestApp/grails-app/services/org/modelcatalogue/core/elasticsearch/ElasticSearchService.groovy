@@ -1,7 +1,11 @@
 package org.modelcatalogue.core.elasticsearch
 
+import org.elasticsearch.action.bulk.BulkRequest
 import org.modelcatalogue.core.api.ElementStatus
 import org.modelcatalogue.core.security.DataModelAclService
+import rx.functions.Func1
+
+import java.util.concurrent.Callable
 
 import static org.modelcatalogue.core.util.HibernateHelper.getEntityClass
 import static rx.Observable.from
@@ -487,18 +491,35 @@ class ElasticSearchService implements SearchCatalogue {
 
 
     private Observable<Boolean> indexSimpleIndexRequests(List<SimpleIndexRequest> indexRequests) {
-        bulkIndex(indexRequests).flatMap { bulkResponse ->
-            from(bulkResponse.items)
-        } map { bulkResponseItem ->
-            if (bulkResponseItem.failure) {
-                log.warn "Failed to index ${bulkResponseItem.type}:${bulkResponseItem.id} to ${bulkResponseItem.index}"
-            } else {
-                log.debug "Indexed ${bulkResponseItem.type}:${bulkResponseItem.id} to ${bulkResponseItem.index}"
-            }
-            SimpleIndexResponse.from(bulkResponseItem)
-        } all {
-            it.ok
+
+        // do bulk index, getting a stream of bulk responses (responses to a execution of a bulk of actions).
+        // So we have a bulk of bulks
+        Observable<BulkResponse> bulkResponses = bulkIndex(indexRequests)
+
+        // get bulk item responses from each bulk response, flatten it all into one stream of bulk item responses
+        Observable<BulkItemResponse> bulkItemResponses = bulkResponses.flatMap {
+            BulkResponse bulkResponse ->
+                BulkItemResponse[] bulkItemResponsesArray = bulkResponse.items
+                Observable<BulkItemResponse> result = from(bulkItemResponsesArray) // this is returned by the closure
         }
+
+        // convert bulk item responses into SimpleIndexResponses (a custom class we have defined)
+        Observable<SimpleIndexResponse> simpleIndexResponses = bulkItemResponses.map {
+            BulkItemResponse bulkItemResponse ->
+                if (bulkItemResponse.failure) {
+                    log.warn "Failed to index ${bulkItemResponse.type}:${bulkItemResponse.id} to ${bulkItemResponse.index}"
+                } else {
+                    log.debug "Indexed ${bulkItemResponse.type}:${bulkItemResponse.id} to ${bulkItemResponse.index}"
+                }
+                SimpleIndexResponse result = SimpleIndexResponse.from(bulkItemResponse)
+        }
+
+        // check all responses are ok (not failed)
+        Observable<Boolean> allOk = simpleIndexResponses.all {
+            SimpleIndexResponse simpleIndexResponse ->
+              simpleIndexResponse.ok
+        }
+        return allOk
     }
 
 
@@ -749,21 +770,39 @@ class ElasticSearchService implements SearchCatalogue {
 
 
     private Observable<BulkResponse> bulkIndex(List<SimpleIndexRequest> documents) {
-        RxElastic.from { buildBulkIndexRequest(documents) }.flatMap {
-            for (BulkItemResponse response in it.items) {
-                if (response.failed) {
-                    if (response.failure.cause instanceof VersionConflictEngineException) {
-                        // ignore and keep the latest
-                        continue
+
+        Callable<BulkRequestBuilder> c = { buildBulkIndexRequest(documents) }
+
+        Observable<BulkResponse> bulkResponses = RxElastic.from(c)
+
+        Observable<BulkResponse> bulkResponsesErrorChecked = bulkResponses.flatMap {
+            BulkResponse bulkResponse ->
+                for (BulkItemResponse response in bulkResponse.items) {
+                    if (response.failed) {
+                        if (response.failure.cause instanceof VersionConflictEngineException) {
+                            // ignore and keep the latest
+                            continue
+                        }
+                        Observable<BulkResponse> errorObservable = Observable.error(new RuntimeException("There were error indexing at least of one item from the batch: $response.type#$response.id@$response.index", response.failure.cause))
+                        return errorObservable
                     }
-                    return Observable.error(new RuntimeException("There were error indexing at least of one item from the batch: $response.type#$response.id@$response.index", response.failure.cause))
                 }
-            }
-            return just(it)
-        }.retryWhen(RxService.withDelay(RxElastic.DEFAULT_RETRIES, RxElastic.DEFAULT_DELAY, [
+                Observable<BulkResponse> justBulkResponse = just(bulkResponse)
+                return justBulkResponse
+        }
+
+
+        Func1<Observable<? extends Throwable>, Observable<?>> whetherToRetryGivenThrowable = RxService.withDelay(RxElastic.DEFAULT_RETRIES, RxElastic.DEFAULT_DELAY, [
             EsRejectedExecutionException,
             IndexNotFoundException // sometimes by race condition
-        ] as Set))
+        ] as Set)
+
+        // on an error emitted by bulkResponsesErrorChecked,
+        // retryWhen will re-subscribe to (re-start from the beginning of) bulkResponsesErrorChecked
+        // if whetherToRetryGivenThrowable accepts the error.
+
+        Observable<BulkResponse> bulkResponsesWithRetries = bulkResponsesErrorChecked.retryWhen(whetherToRetryGivenThrowable)
+
     }
 
     private BulkRequestBuilder buildBulkIndexRequest(List<SimpleIndexRequest> indexRequests) {
