@@ -357,7 +357,7 @@ angular.module('mc.core.ui.bs.catalogueElementActions', ['mc.util.ui.actions']).
       icon:       'fa fa-fw fa-chain'
       type:       'success'
       watches:    ['element.status', 'element.archived']
-      disabled:   $scope.element.archived
+      #disabled:   $scope.element.archived
       action:     ->
         messages.prompt('Create Relationship', '', {type: 'create-new-relationship', element: $scope.element, currentDataModel: $scope.currentDataModel}).catch showErrorsUsingMessages(messages)
     }
